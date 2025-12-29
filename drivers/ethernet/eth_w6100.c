@@ -208,8 +208,6 @@ static int w6100_tx(const struct device *dev, struct net_pkt *pkt)
 	uint8_t off[2];
 	int ret;
 
-	LOG_INF("tx");
-
 	w6100_spi_read(dev, W6100_Sn(0, W6100_S_TX_WR), off, 2);
 	offset = sys_get_be16(off);
 
@@ -246,8 +244,6 @@ static void w6100_rx(const struct device *dev)
 	struct net_pkt *pkt;
 	struct w6100_runtime *ctx = dev->data;
 	const struct w6100_config *config = dev->config;
-
-	LOG_INF("rx");
 
 	w6100_spi_read(dev, W6100_Sn(0, W6100_S_RX_RSR), tmp, 2);
 	rx_buf_len = sys_get_be16(tmp);
@@ -335,8 +331,6 @@ static void w6100_thread(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	LOG_INF("thread started");
-
 	const struct device *dev = p1;
 	uint8_t ir;
 	int res;
@@ -346,9 +340,6 @@ static void w6100_thread(void *p1, void *p2, void *p3)
 	while(true) {
 		res = k_sem_take(&ctx->int_sem, K_MSEC(CONFIG_ETH_W6100_MONITOR_PERIOD));
 
-		//LOG_INF("thread, res=%d", res);
-		//w6100_dump(dev);
-
 		if (res == 0) {
 			/* semaphore taken, update link status and receive packets */
 			if (ctx->link_up != true) {
@@ -356,27 +347,20 @@ static void w6100_thread(void *p1, void *p2, void *p3)
 			}
 
 			uint8_t ir = gpio_pin_get_dt(&(config->interrupt));
-			LOG_INF("thread, ir=%d", ir);
 			while (ir) {
 				/* Read interrupt */
 				w6100_spi_read(dev, W6100_Sn(0, W6100_S_IR), &ir, 1);
-
-				LOG_INF("IR received: %x", ir);
-
-				if (ir) {
+			    if (ir) {
 					/* Clear interrupt */
 					w6100_spi_write(dev, W6100_Sn(0, W6100_S_IRCLR), &ir, 1);
-
-					LOG_INF("IR received");
-
 					if (ir & S_IR_SENDOK) {
 						k_sem_give(&ctx->tx_sem);
-						LOG_INF("TX Done");
+						LOG_DBG("TX Done");
 					}
 
 					if (ir & S_IR_RECV) {
 						w6100_rx(dev);
-						LOG_INF("RX Done");
+						LOG_DBG("RX Done");
 					}
 				}
 			}
@@ -423,7 +407,6 @@ static int w6100_set_config(const struct device *dev,
 {
     struct w6100_runtime *ctx = dev->data;
 
-    LOG_INF("set config");
     switch (type) {
 	case ETHERNET_CONFIG_TYPE_MAC_ADDRESS:
 	    memcpy(ctx->mac_addr,
@@ -495,8 +478,6 @@ static int w6100_hw_start(const struct device *dev)
 {
     uint8_t mode = S_MR_MACRAW;
     //| BIT(S_MR_BRDB);
-	LOG_INF("hw start");
-
 	/* configure Socket 0 with MACRAW mode */
 	w6100_spi_write(dev, W6100_Sn(0, W6100_Sn_MR), &mode, 1);
 
@@ -550,8 +531,6 @@ static void w6100_gpio_callback(const struct device *dev,
 {
 	struct w6100_runtime *ctx =
 		CONTAINER_OF(cb, struct w6100_runtime, gpio_cb);
-
-	LOG_INF("gpio_callback");
 
 	k_sem_give(&ctx->int_sem);
 }
@@ -631,14 +610,12 @@ static int w6100_init(const struct device *dev)
 		return -EINVAL;
 	}
 
-	LOG_INF("preinit interrupt pin");
 	err = gpio_pin_configure_dt(&config->interrupt, GPIO_INPUT);
 	if (err < 0) {
 		LOG_ERR("Unable to configure GPIO pin %u", config->interrupt.pin);
 		return err;
 	}
 
-	LOG_INF("preinit interrupt callback");
 	gpio_init_callback(&(ctx->gpio_cb), w6100_gpio_callback,
 			   BIT(config->interrupt.pin));
 	err = gpio_add_callback(config->interrupt.port, &(ctx->gpio_cb));
@@ -647,7 +624,6 @@ static int w6100_init(const struct device *dev)
 		return err;
 	}
 
-	LOG_INF("configuring interrupt");
 	err = gpio_pin_interrupt_configure_dt(&config->interrupt,
 					      GPIO_INT_EDGE_FALLING);
 	if (err < 0) {
@@ -677,7 +653,6 @@ static int w6100_init(const struct device *dev)
 		k_msleep(65);
 	}
 
-	LOG_INF("soft reset");
 	err = w6100_soft_reset(dev);
 	if (err < 0) {
 		LOG_ERR("Unable to soft reset");
