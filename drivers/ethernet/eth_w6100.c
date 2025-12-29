@@ -98,40 +98,38 @@ static int w6100_spi_write(const struct device *dev, uint32_t addr,
 		return ret;
 }
 
-static void w6100_thread(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
+static int w6100_dump(const struct device *dev) {
+    const struct w6100_config *config = dev->config;
 
+    int val = gpio_pin_get_dt(&config->interrupt);
+    LOG_INF("INT pin level = %d", val);
+
+    uint8_t int_counter[2];
+    w6100_spi_read(dev, 0x41C5, int_counter, 2);
+    LOG_INF("INT counter = %d", int_counter[0] | (int_counter[1] << 8));
+
+    uint8_t ir;
+    w6100_spi_read(dev, W6100_IR, &ir, 1);
+    LOG_INF("IR = %x", ir);
+
+    w6100_spi_read(dev, W6100_SIR, &ir, 1);
+    LOG_INF("SIR = %x", ir);
+
+    w6100_spi_read(dev, W6100_Sn(0, W6100_S_IR), &ir, 1);
+    LOG_INF("S0_IR = %x", ir);
+
+    w6100_spi_read(dev, W6100_SLIR, &ir, 1);
+    LOG_INF("SLIR = %x", ir);
+
+    w6100_spi_read(dev, W6100_PHYSR, &ir, 1);
+    LOG_INF("PHYSR = %02hhX", ir);
+
+    w6100_spi_read(dev, W6100_SYSR, &ir, 1);
+    LOG_INF("SYSR = %02hhX", ir);
+
+    return 0;
 }
 
-static void w6100_iface_init(struct net_if *iface)
-{
-}
-
-static int w6100_tx(const struct device *dev, struct net_pkt *pkt)
-{
-	struct w6100_runtime *ctx = dev->data;
-
-	return 0;
-}
-
-static enum ethernet_hw_caps w6100_get_capabilities(const struct device *dev)
-{
-	ARG_UNUSED(dev);
-
-	return ETHERNET_LINK_10BASE | ETHERNET_LINK_100BASE
-#if defined(CONFIG_NET_PROMISCUOUS_MODE)
-		| ETHERNET_PROMISC_MODE
-#endif
-	;
-}
-
-static int w6100_set_config(const struct device *dev,
-			    enum ethernet_config_type type,
-			    const struct ethernet_config *config)
-{
-}
 
 static int w6100_command(const struct device *dev, uint8_t cmd)
 {
@@ -152,23 +150,382 @@ static int w6100_command(const struct device *dev, uint8_t cmd)
 	return 0;
 }
 
-static int w6100_hw_start(const struct device *dev)
+static int w6100_readbuf(const struct device *dev, uint16_t offset, uint8_t *buf,
+			 size_t len)
 {
-    uint8_t mode = S_MR_MACRAW | BIT(S_MR_BRDB);
-	uint8_t mask = SIMR_S0;
+	uint32_t addr;
+	size_t remain = 0;
+	int ret;
+	const uint32_t mem_start = W6100_Sn(0, W6100_S_RX_MEM_START);
+	const uint32_t mem_size = W6100_S_RX_MEM_SIZE;
 
-	/* configure Socket 0 with MACRAW mode and MAC filtering enabled */
-	w6100_spi_write(dev, W6100_Sn(0, W6100_Sn_MR), &mode, 1);
-	w6100_command(dev, S_CR_OPEN);
+	offset %= mem_size;
+	addr = mem_start + offset;
 
-	/* enable interrupt */
+	if (offset + len > mem_size) {
+		remain = (offset + len) % mem_size;
+		len = mem_size - offset;
+	}
+
+	ret = w6100_spi_read(dev, addr, buf, len);
+	if (ret || !remain) {
+		return ret;
+	}
+
+	return w6100_spi_read(dev, mem_start, buf + len, remain);
+}
+
+static int w6100_writebuf(const struct device *dev, uint16_t offset, uint8_t *buf,
+			  size_t len)
+{
+	uint32_t addr;
+	size_t remain = 0;
+	int ret;
+	const uint32_t mem_start = W6100_Sn(0, W6100_S_TX_MEM_START);
+	const uint32_t mem_size = W6100_S_TX_MEM_SIZE;
+
+	offset %= mem_size;
+	addr = mem_start + offset;
+
+	if (offset + len > mem_size) {
+		remain = (offset + len) % mem_size;
+		len = mem_size - offset;
+	}
+
+	ret = w6100_spi_write(dev, addr, buf, len);
+	if (ret || !remain) {
+		return ret;
+	}
+
+	return w6100_spi_write(dev, mem_start, buf + len, remain);
+}
+
+static int w6100_tx(const struct device *dev, struct net_pkt *pkt)
+{
+	struct w6100_runtime *ctx = dev->data;
+	uint16_t len = (uint16_t)net_pkt_get_len(pkt);
+	uint16_t offset;
+	uint8_t off[2];
+	int ret;
+
+	LOG_INF("tx");
+
+	w6100_spi_read(dev, W6100_Sn(0, W6100_S_TX_WR), off, 2);
+	offset = sys_get_be16(off);
+
+	if (net_pkt_read(pkt, ctx->buf, len)) {
+		return -EIO;
+	}
+
+	ret = w6100_writebuf(dev, offset, ctx->buf, len);
+	if (ret < 0) {
+		return ret;
+	}
+
+	sys_put_be16(offset + len, off);
+	w6100_spi_write(dev, W6100_Sn(0, W6100_S_TX_WR), off, 2);
+
+	w6100_command(dev, S_CR_SEND);
+	if (k_sem_take(&ctx->tx_sem, K_MSEC(10))) {
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static void w6100_rx(const struct device *dev)
+{
+	uint8_t header[2];
+	uint8_t tmp[2];
+	uint16_t off;
+	uint16_t rx_len;
+	uint16_t rx_buf_len;
+	uint16_t read_len;
+	uint16_t reader;
+	struct net_buf *pkt_buf = NULL;
+	struct net_pkt *pkt;
+	struct w6100_runtime *ctx = dev->data;
+	const struct w6100_config *config = dev->config;
+
+	LOG_INF("rx");
+
+	w6100_spi_read(dev, W6100_Sn(0, W6100_S_RX_RSR), tmp, 2);
+	rx_buf_len = sys_get_be16(tmp);
+
+	if (rx_buf_len == 0) {
+		return;
+	}
+
+	w6100_spi_read(dev, W6100_Sn(0, W6100_S_RX_RD), tmp, 2);
+	off = sys_get_be16(tmp);
+
+	w6100_readbuf(dev, off, header, 2);
+	rx_len = sys_get_be16(header) - 2;
+
+	pkt = net_pkt_rx_alloc_with_buffer(ctx->iface, rx_len,
+			NET_AF_UNSPEC, 0, K_MSEC(config->timeout));
+	if (!pkt) {
+		eth_stats_update_errors_rx(ctx->iface);
+		return;
+	}
+
+	pkt_buf = pkt->buffer;
+
+	read_len = rx_len;
+	reader = off + 2;
+
+	do {
+		size_t frag_len;
+		uint8_t *data_ptr;
+		size_t frame_len;
+
+		data_ptr = pkt_buf->data;
+
+		frag_len = net_buf_tailroom(pkt_buf);
+
+		if (read_len > frag_len) {
+			frame_len = frag_len;
+		} else {
+			frame_len = read_len;
+		}
+
+		w6100_readbuf(dev, reader, data_ptr, frame_len);
+		net_buf_add(pkt_buf, frame_len);
+		reader += (uint16_t)frame_len;
+
+		read_len -= (uint16_t)frame_len;
+		pkt_buf = pkt_buf->frags;
+	} while (read_len > 0);
+
+	if (net_recv_data(ctx->iface, pkt) < 0) {
+		net_pkt_unref(pkt);
+	}
+
+	sys_put_be16(off + 2 + rx_len, tmp);
+	w6100_spi_write(dev, W6100_Sn(0, W6100_S_RX_RD), tmp, 2);
+	w6100_command(dev, S_CR_RECV);
+}
+
+static void w6100_update_link_status(const struct device *dev)
+{
+	uint8_t phycfgr;
+	struct w6100_runtime *ctx = dev->data;
+
+	if (w6100_spi_read(dev, W6100_PHYSR, &phycfgr, 1) < 0) {
+		return;
+	}
+
+	if (phycfgr & 0x01) {
+		if (ctx->link_up != true) {
+			LOG_INF("%s: Link up", dev->name);
+			ctx->link_up = true;
+			net_eth_carrier_on(ctx->iface);
+		}
+	} else {
+		if (ctx->link_up != false) {
+			LOG_INF("%s: Link down", dev->name);
+			ctx->link_up = false;
+			net_eth_carrier_off(ctx->iface);
+		}
+	}
+}
+
+static void w6100_thread(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	LOG_INF("thread started");
+
+	const struct device *dev = p1;
+	uint8_t ir;
+	int res;
+	struct w6100_runtime *ctx = dev->data;
+	const struct w6100_config *config = dev->config;
+
+	while(true) {
+		res = k_sem_take(&ctx->int_sem, K_MSEC(CONFIG_ETH_W6100_MONITOR_PERIOD));
+
+		//LOG_INF("thread, res=%d", res);
+		//w6100_dump(dev);
+
+		if (res == 0) {
+			/* semaphore taken, update link status and receive packets */
+			if (ctx->link_up != true) {
+				w6100_update_link_status(dev);
+			}
+
+			uint8_t ir = gpio_pin_get_dt(&(config->interrupt));
+			LOG_INF("thread, ir=%d", ir);
+			while (ir) {
+				/* Read interrupt */
+				w6100_spi_read(dev, W6100_Sn(0, W6100_S_IR), &ir, 1);
+
+				LOG_INF("IR received: %x", ir);
+
+				if (ir) {
+					/* Clear interrupt */
+					w6100_spi_write(dev, W6100_Sn(0, W6100_S_IRCLR), &ir, 1);
+
+					LOG_INF("IR received");
+
+					if (ir & S_IR_SENDOK) {
+						k_sem_give(&ctx->tx_sem);
+						LOG_INF("TX Done");
+					}
+
+					if (ir & S_IR_RECV) {
+						w6100_rx(dev);
+						LOG_INF("RX Done");
+					}
+				}
+			}
+		} else if (res == -EAGAIN) {
+			/* semaphore timeout period expired, check link status */
+			w6100_update_link_status(dev);
+		}
+	}
+}
+
+static void w6100_iface_init(struct net_if *iface)
+{
+    const struct device *dev = net_if_get_device(iface);
+	struct w6100_runtime *ctx = dev->data;
+
+	net_if_set_link_addr(iface, ctx->mac_addr,
+			     sizeof(ctx->mac_addr),
+			     NET_LINK_ETHERNET);
+
+	if (!ctx->iface) {
+		ctx->iface = iface;
+	}
+
+	ethernet_init(iface);
+
+	/* Do not start the interface until PHY link is up */
+	net_if_carrier_off(iface);
+}
+
+static enum ethernet_hw_caps w6100_get_capabilities(const struct device *dev)
+{
+	ARG_UNUSED(dev);
+
+	return ETHERNET_LINK_10BASE | ETHERNET_LINK_100BASE
+#if defined(CONFIG_NET_PROMISCUOUS_MODE)
+		| ETHERNET_PROMISC_MODE
+#endif
+	;
+}
+
+static int w6100_set_config(const struct device *dev,
+			    enum ethernet_config_type type,
+			    const struct ethernet_config *config)
+{
+    struct w6100_runtime *ctx = dev->data;
+
+    LOG_INF("set config");
+    switch (type) {
+	case ETHERNET_CONFIG_TYPE_MAC_ADDRESS:
+	    memcpy(ctx->mac_addr,
+			config->mac_address.addr,
+			sizeof(ctx->mac_addr));
+		w6100_spi_write(dev, W6100_SHAR, ctx->mac_addr, sizeof(ctx->mac_addr));
+		LOG_INF("%s MAC set to %02x:%02x:%02x:%02x:%02x:%02x",
+			dev->name,
+			ctx->mac_addr[0], ctx->mac_addr[1],
+			ctx->mac_addr[2], ctx->mac_addr[3],
+			ctx->mac_addr[4], ctx->mac_addr[5]);
+
+		/* Register Ethernet MAC Address with the upper layer */
+		net_if_set_link_addr(ctx->iface, ctx->mac_addr,
+			sizeof(ctx->mac_addr),
+			NET_LINK_ETHERNET);
+
+		return 0;
+	case ETHERNET_CONFIG_TYPE_PROMISC_MODE:
+        LOG_INF("promisc mode");
+	    if (IS_ENABLED(CONFIG_NET_PROMISCUOUS_MODE)) {
+			uint8_t mode;
+			uint8_t mr = S_MR_BRDB;
+			w6100_spi_read(dev, W6100_Sn(0, W6100_Sn_MR), &mode, 1);
+
+			if (config->promisc_mode) {
+				if (!(mode & BIT(mr))) {
+					return -EALREADY;
+				}
+
+				/* disable MAC filtering */
+				WRITE_BIT(mode, mr, 0);
+			} else {
+				if (mode & BIT(mr)) {
+					return -EALREADY;
+				}
+
+				/* enable MAC filtering */
+				WRITE_BIT(mode, mr, 1);
+			}
+
+			return w6100_spi_write(dev, W6100_Sn(0, W6100_Sn_MR), &mode, 1);
+		}
+
+		return -ENOTSUP;
+	default:
+		return -ENOTSUP;
+	}
+}
+
+static int w6100_configure_interrupts(const struct device *dev)
+{
+	/* Enable interrupt pin */
+	uint8_t mask = 0x80;
+	w6100_spi_write(dev, W6100_SYCR1, &mask, 1);
+
+	/* Enable interrupts for the sockets we want (S0) */
+	mask = SIMR_S0;
 	w6100_spi_write(dev, W6100_SIMR, &mask, 1);
 
-    return 0;
+	/* Enable SENDOK,RECV interrupt for socket 0 */
+	mask = S_IMR_SENDOK | S_IMR_RECV;
+	w6100_spi_write(dev, W6100_Sn(0, W6100_S_IMR), &mask, 1);
+
+	return 0;
+}
+
+static int w6100_hw_start(const struct device *dev)
+{
+    uint8_t mode = S_MR_MACRAW;
+    //| BIT(S_MR_BRDB);
+	LOG_INF("hw start");
+
+	/* configure Socket 0 with MACRAW mode */
+	w6100_spi_write(dev, W6100_Sn(0, W6100_Sn_MR), &mode, 1);
+
+	w6100_configure_interrupts(dev);
+
+	// OPEN
+	w6100_command(dev, S_CR_OPEN);
+
+	// Check we're in MACRAW
+	w6100_spi_read(dev, W6100_Sn(0, W6100_Sn_MR), &mode, 1);
+	if (!(mode & S_MR_MACRAW)) {
+		LOG_ERR("Failed to enter MACRAW mode, S0_MR read back as %02hhX", mode);
+		return -EIO;
+	}
+
+	return 0;
 }
 
 static int w6100_hw_stop(const struct device *dev)
 {
+   	LOG_INF("hw stop");
+
+    uint8_t mask = 0;
+
+	/* disable interrupt */
+	w6100_spi_write(dev, W6100_SIMR, &mask, 1);
+	w6100_command(dev, S_CR_CLOSE);
+
+	return 0;
 }
 
 static const struct ethernet_api w6100_api_funcs = {
@@ -194,13 +551,15 @@ static void w6100_gpio_callback(const struct device *dev,
 	struct w6100_runtime *ctx =
 		CONTAINER_OF(cb, struct w6100_runtime, gpio_cb);
 
+	LOG_INF("gpio_callback");
+
 	k_sem_give(&ctx->int_sem);
 }
 
 static void w6100_memory_configure(const struct device *dev)
 {
 	int i;
-	uint8_t mem = 0x10;
+	uint8_t mem = 0x10; // 16KB
 
 	/* Configure RX & TX memory to 16K for socket 0 */
 	w6100_spi_write(dev, W6100_Sn(0, W6100_Sn_RX_BSR), &mem, 1);
@@ -212,6 +571,45 @@ static void w6100_memory_configure(const struct device *dev)
 		w6100_spi_write(dev, W6100_Sn(i, W6100_Sn_RX_BSR), &mem, 1);
 		w6100_spi_write(dev, W6100_Sn(i, W6100_Sn_TX_BSR), &mem, 1);
 	}
+}
+
+static int w6100_soft_reset(const struct device *dev)
+{
+    int err;
+
+    //uint8_t unlock = CHPLCKR_UNLOCK;
+    //err = w6100_spi_write(dev, W6100_CHPLCKR, &unlock, 1);
+    //if (err < 0) {
+    //    LOG_ERR("Unable to unlock");
+    //    return err;
+    //}
+
+    //uint8_t reset = SYCR0_SOFT_RESET;
+    //err = w6100_spi_write(dev, W6100_SYCR0, &reset, 1);
+    //if (err < 0) {
+    //    LOG_ERR("Unable to reset");
+    //    return err;
+    //}
+
+    // Wait for reset to complete
+    //k_msleep(5);
+
+    /* Disable interrupts */
+	uint8_t mask = 0x00;
+	w6100_spi_write(dev, W6100_SYCR1, &mask, 1);
+	w6100_spi_write(dev, W6100_IMR, &mask, 1);
+	w6100_spi_write(dev, W6100_SLIMR, &mask, 1);
+	w6100_spi_write(dev, W6100_SIMR, &mask, 1);
+	w6100_spi_write(dev, W6100_Sn(0, W6100_S_IMR), &mask, 1);
+
+    //uint8_t lock = 0x00;
+    //err = w6100_spi_write(dev, W6100_CHPLCKR, &unlock, 1);
+    //if (err < 0) {
+    //    LOG_ERR("Unable to lock");
+    //    return err;
+    //}
+
+    return 0;
 }
 
 static int w6100_init(const struct device *dev)
@@ -233,12 +631,14 @@ static int w6100_init(const struct device *dev)
 		return -EINVAL;
 	}
 
+	LOG_INF("preinit interrupt pin");
 	err = gpio_pin_configure_dt(&config->interrupt, GPIO_INPUT);
 	if (err < 0) {
 		LOG_ERR("Unable to configure GPIO pin %u", config->interrupt.pin);
 		return err;
 	}
 
+	LOG_INF("preinit interrupt callback");
 	gpio_init_callback(&(ctx->gpio_cb), w6100_gpio_callback,
 			   BIT(config->interrupt.pin));
 	err = gpio_add_callback(config->interrupt.port, &(ctx->gpio_cb));
@@ -247,6 +647,7 @@ static int w6100_init(const struct device *dev)
 		return err;
 	}
 
+	LOG_INF("configuring interrupt");
 	err = gpio_pin_interrupt_configure_dt(&config->interrupt,
 					      GPIO_INT_EDGE_FALLING);
 	if (err < 0) {
@@ -276,15 +677,10 @@ static int w6100_init(const struct device *dev)
 		k_msleep(65);
 	}
 
-	//err = w6100_soft_reset(dev);
-	// W6100 has soft reset (see SYCR0)
-	// but I couldn't figure out the status lock stuff
-
-	// Disable interrupts on all sockets
-	uint8_t mask = 0;
-	err = w6100_spi_write(dev, W6100_SIMR, &mask, 1);
-	if (err != 0) {
-		LOG_ERR("Failed to disable socket interrupts");
+	LOG_INF("soft reset");
+	err = w6100_soft_reset(dev);
+	if (err < 0) {
+		LOG_ERR("Unable to soft reset");
 		return err;
 	}
 
